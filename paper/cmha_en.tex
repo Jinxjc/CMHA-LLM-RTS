@@ -1,0 +1,182 @@
+% CMHA paper — EMNLP-style draft (compile with pdflatex + bibtex)
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\setlist{nosep,leftmargin=*}
+
+\title{CMHA: A Hierarchical Agent with Counterfactual Memory for Real-Time Strategy Games}
+
+\author{Anonymous Authors}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Deploying large language models (LLMs) in environments such as real-time strategy (RTS) games to test reasoning and decision-making has become an active research direction. Existing pipelines often rely on conventional memory retrieval and a single cloud LLM for all layers, which leads to severe cognitive and latency bottlenecks. We propose \textbf{CMHA}, a hierarchical agent with counterfactual memory. At the macro level, we design a dual counterfactual memory mechanism that actively curates context via causal-overwrite pruning. At the micro level, we use two-stage fine-tuning and action pruning: a locally deployed 2.8B model fine-tuned with QLoRA maps high-level directives to executable low-level actions. The design avoids heavy deployment cost while preserving tactical coherence and cutting inference delay. Experiments on \textsc{LLM-PySC2} show that CMHA outperforms cloud-LLM baselines and offers a practical deployment pattern for agents in complex environments.
+\end{abstract}
+
+\section{Introduction}
+
+Large language models (LLMs) show strong generalization and reasoning across downstream tasks, from code generation to tool use (Brown et al., 2020; Touvron et al., 2023). A growing line of work deploys LLMs as autonomous agents in RTS games to stress-test strategic reasoning (Ma et al., 2024; Wang et al., 2024). \textit{StarCraft~II} is a common benchmark because of fast-paced dynamics, partial observability from fog of war, and non-trivial economy--combat trade-offs.
+
+Classical approaches to \textit{StarCraft~II} rely on reinforcement learning, but these models are hard to interpret, need large compute for trial-and-error, and generalize poorly to unseen tactics \citep{vinyals2019}. Recent work shifts toward monolithic cloud LLM agents (Zheng et al., 2023; Xu et al., 2024). That setup still faces clear limits. First, cloud inference latency often makes tactical orders arrive too late. Second, as interaction history grows, standard memory retrieval accumulates redundant observations (Park et al., 2023; Wang et al., 2023). The extra noise pushes the agent to flip between conflicting goals and causes visible \emph{strategic jitter}.
+
+Aligning LLM semantics with the action space of the environment is another open issue. Some methods fall back to finite-state machines or behavior trees (Peng et al., 2024; Shao et al., 2024). They respect game rules but rigidify control and cap what the LLM can decide. What is needed is a design that cuts cloud latency and memory redundancy without letting hallucination (1111) dominate execution.
+
+We introduce \textbf{CMHA}, a hierarchical architecture built on counterfactual memory. It has two main parts: (1)~\textbf{Strategy Pulse Chain Brain (SPC)}, which runs slow-clock macro reasoning and manages memory with a structured chain-of-thought; (2)~\textbf{Tactical-Phi}, a QLoRA-tuned local 2.8B model that turns SPC intent into grounded commands. On admission, counterfactual queries decide whether a new observation warrants replanning; in storage, causal-overwrite pruning drops events that no longer matter. We add action pruning to shrink the decision space and a self-correcting action sandbox at the bottom layer.
+
+Our contributions are:
+\begin{itemize}
+  \item \textbf{CMHA}, an asynchronous hierarchical framework that keeps LLM reasoning while action pruning and a self-correcting sandbox close the micro execution loop and reduce hallucination rate.
+  \item A memory mechanism that tracks long-horizon events and cuts strategic jitter from oversized history.
+  \item Broad experiments on \textsc{LLM-PySC2}: CMHA matches GPT-4o-mini-level macro depth with roughly 57\% lower decision latency and nearly 80\% fewer tokens.
+\end{itemize}
+
+% Figure 1 placeholder
+% \begin{figure}[t]
+%   \centering
+%   \includegraphics[width=\linewidth]{figures/overview.pdf}
+%   \caption{Overview of CMHA.}
+% \end{figure}
+
+\section{Related Work}
+
+\paragraph{RTS environments for LLM agents.}
+Early \textit{StarCraft~II} research used RL with the PySC2 API. AlphaStar \citep{vinyals2019} showed RL could reach high skill but remains costly and weak on out-of-distribution tactics. With LLMs, TextSC2 (Wang et al., 2024) and SwarmBrain (Zheng et al., 2024) map game APIs to natural language. \textsc{LLM-PySC2} \citep{ma2025} supports the full PySC2 action space and adds structured wiki knowledge.
+
+\paragraph{Memory for long horizons.}
+LLM agents in long episodes need stable memory. Chain-of-thought (Wei et al., 2021) and RAG (Lewis et al., 2021) help, but thousands of steps in \textit{StarCraft~II} still produce redundant context. Summary chains (Wang et al., 2024) aggregate frames periodically. COMPASS (2025) builds global entity memory via multi-hop communication; StarWM (2026) uses a structured world model to refine policy from predicted dynamics. Most prior memory designs emphasize short-term accumulation and lack explicit long-horizon pruning.
+
+\paragraph{Instruction--action alignment.}
+Recent work grounds LLM plans in executable actions in several ways. SwarmBrain (2024) uses state machines for reactive control; Adaptive Command (2025) ties behavior trees to hard rule checks. These methods execute reliably but limit LLM reasoning and generalization. \textsc{LLM-PySC2} \citep{ma2025} uses a cloud LLM end-to-end, at the cost of latency and hallucinations. SC-Phi2 (2024) shows that fine-tuning a local model on SC2 text data can handle macro management.
+
+\section{Method}
+
+We describe CMHA in four parts: overview (\S\ref{sec:overview}), memory and reasoning (\S\ref{sec:memory}), the action loop (\S\ref{sec:sandbox}), and Tactical-Phi fine-tuning (\S\ref{sec:phi}).
+
+% Figure 2 placeholder
+
+\subsection{CMHA framework overview}
+\label{sec:overview}
+
+At each step $t$, the agent observes $o_t$ and outputs a legal grounded action sequence $a^*_t$. CMHA keeps macro state across steps: strategic pulse $p_t$ (attack / expand / retreat / defend), inertia $h_t$ (how long $p_t$ has held), and event memory $\mathcal{M}_{\text{event}}$. The pipeline splits into three asynchronous layers:
+\begin{itemize}
+  \item \textbf{SPC:} Inputs are global $o_t$ and $(\mathcal{M}_{\text{event}}, p_{t-1}, h_{t-1})$. It runs on a slow clock, fuses memory with SP-CoT, and outputs macro intent $(p_t, \mathcal{V}_t)$ to the tactical layer.
+  \item \textbf{Tactical adapter:} Runs on a fast clock with local observations and $(p_t, \mathcal{V}_t)$. A lightweight model emits raw actions $a_{\text{raw}}$.
+  \item \textbf{Action sandbox:} Validates $a_{\text{raw}}$ against the environment, self-corrects on failure, and outputs $a^*_t$.
+\end{itemize}
+
+\subsection{Memory and reasoning}
+\label{sec:memory}
+
+Memory maintenance and use follow four stages so SPC can output stable macro strategy via SP-CoT.
+
+\paragraph{Stage 1: Temporal slicing and aggregation.}
+A sliding window of width $w$ groups observations $W_t = \{o_{t-w+1}, \ldots, o_t\}$. A top LLM summarizes each window into a semantic snippet $\tilde{\varepsilon}_t$:
+\begin{equation}
+\tilde{\varepsilon}_t \sim \text{LLM\_Summarize}(W_t, \text{Prompt}_{\text{agg}}).
+\end{equation}
+
+\paragraph{Stage 2: Counterfactual admission.}
+Before reasoning, the system asks: given $\mathcal{M}_{\text{event}}$, if we force $\tilde{\varepsilon}_t = \emptyset$ (written $do(\tilde{\varepsilon}_t = \emptyset)$), would understanding of $o_t$ or pulse $p_{t-1}$ break? The model returns $\mathbb{I}_{\text{keep}} \in \{0,1\}$:
+\begin{equation}
+\mathbb{I}_{\text{keep}} = \text{LLM\_Admit}\left( o_t, p_{t-1}, \mathcal{M}_{\text{event}}, do(\tilde{\varepsilon}_t = \emptyset), \mathcal{D}_{\text{all}} \right).
+\end{equation}
+If $\mathbb{I}_{\text{keep}}=0$ (\textbf{Sleep Mode}), the event is dropped, $p_t = p_{t-1}$, and $h_t = h_{t-1}+1$. If $\mathbb{I}_{\text{keep}}=1$ (\textbf{Wake Mode}), $\tilde{\varepsilon}_t$ becomes $\varepsilon_t$, is stored in $\mathcal{M}_{\text{event}}$, and Stage~4 runs.
+
+\paragraph{Stage 3: Semantic pruning.}
+For each $\varepsilon_i \in \mathcal{M}_{\text{event}}$, the model checks whether recent $o_t$ logically supersedes $\varepsilon_i$ or its intent has ended:
+\begin{equation}
+\mathbb{I}_{\text{prune}} = \text{LLM\_Prune}\left( o_t, \varepsilon_i \right).
+\end{equation}
+If $\mathbb{I}_{\text{prune}}=1$, the event is removed.
+
+\paragraph{Stage 4: SP-CoT reasoning.}
+Only in Wake Mode does SPC run full reasoning:
+\begin{equation}
+\mathcal{C}_t \sim \text{LLM\_Reason}(o_t, \mathcal{M}_{\text{event}}, p_{t-1}, h_{t-1}, \text{Prompt}_{\text{sp}}).
+\end{equation}
+SP-CoT follows: enemy assessment $\rightarrow$ intent reflection $\rightarrow$ macro choice, yielding $(p_t, \mathcal{V}_t)$ and
+\begin{equation}
+h_t = \begin{cases}
+h_{t-1} + 1 & \text{if } p_t = p_{t-1} \\
+0 & \text{if } p_t \neq p_{t-1}.
+\end{cases}
+\end{equation}
+
+\subsection{Action execution loop}
+\label{sec:sandbox}
+
+Before the tactical layer acts, unit stats (energy, cooldowns, etc.) filter invalid options to $\mathcal{A}_{\text{valid}}$. Raw output $a_{\text{raw}}$ enters the sandbox; format or execution errors trigger up to two retries with feedback, then a safe fallback. The final step is
+\begin{equation}
+a_t^* = \text{Sandbox}(a_{\text{raw}}, \mathcal{A}_{\text{valid}}).
+\end{equation}
+
+\subsection{Tactical-Phi fine-tuning}
+\label{sec:phi}
+
+We deploy a local 2.8B Phi-2 model with two-stage QLoRA (details in the appendix). Stage~1 uses the SC2 Text Dataset (2024) for text supervision with frozen backbone and LoRA on attention and FFN. Stage~2 aligns semantics from human replays via MSC-style reconstruction (2017): input $X_t$ combines discretized resources/supply, build/tech state, and situational tactics; output $Y_{\text{alias}}$ uses short action aliases over four steps to avoid PySC2 template bias. Loss masks $X_t$ and trains only on aliases:
+\begin{equation}
+\mathcal{L}_{\text{align}} = - \sum_{j=1}^{|Y_{\text{alias}}|} \log P(y_j \mid X_t, y_{<j}; \Theta_{\text{tuned}}),
+\end{equation}
+where $\Theta_{\text{tuned}}$ are QLoRA-updated weights. Aliases are mapped back to native actions at runtime.
+
+\section{Experiments}
+
+\subsection{Setup}
+
+All runs use \textit{StarCraft~II} (v5.0.15) and \textsc{LLM-PySC2}. Tactical-Phi runs on a single RTX~3090. Unlike simplified RTS benchmarks, \textsc{LLM-PySC2} exposes the full action space. We use map \textbf{Simple64}, built-in AI Levels~1--7, \textbf{ECSB} mode (highest complexity in our setting), and 12 seeds per condition. We also report selected \textbf{SMAC} tasks.
+
+\paragraph{Baselines.}
+Because of environment complexity, earlier simplified agents are not directly comparable. We use the multi-agent setup shipped with \textsc{LLM-PySC2} as the baseline.
+
+\paragraph{Metrics.}
+\begin{itemize}
+  \item \textbf{WR} — win rate;
+  \item \textbf{SSF} — strategic switches of $p_t$ per game (stability);
+  \item \textbf{HF} — illegal / unexecutable actions per game;
+  \item \textbf{RSF} — sandbox corrections per game;
+  \item \textbf{DL} — mean end-to-end decision time per step;
+  \item \textbf{TC} — tokens per game.
+\end{itemize}
+
+\subsection{Main results}
+
+Table~1 (ECSB, Simple64): the cloud baseline collapses at Level~3 (0\% WR) on long games. CMHA stays near 100\% WR on easy levels and reaches 50--60\% at Level~4, staying viable through Level~6. With Tactical-Phi as the tactical adapter, WR stays close to the all-cloud CMHA variant; unfine-tuned Phi-2 performs much worse, confirming the value of alignment fine-tuning. Plugging the local model into the flat baseline hurts WR at all levels—the single-layer design loses macro reasoning that CMHA's hierarchy preserves.
+
+Table~2 (SMAC): CMHA improves KD and WR over the baseline. The local model on the flat baseline still works reasonably on micro tasks, supporting the split between macro (SPC) and micro (Tactical-Phi).
+
+\subsection{Analysis}
+
+\paragraph{Memory.}
+Full CMHA vs.\ CMHA w/o memory: both reach 100\% WR on easy levels; from Level~3 onward the ablation drops to 50\% and fails from Level~5, while full CMHA holds through Level~6. SSF is higher without memory—counterfactual admission and pruning reduce jitter.
+
+\paragraph{Action loop.}
+Baseline vs.\ baseline w/ sandbox: HF drops at all levels; RSF nears 100 corrections per game at Levels~3--4, showing the sandbox keeps actions executable.
+
+\paragraph{Lightweight model.}
+On Levels~3--6, Baseline (4omini) and CMHA (4omini) exceed 3\,s/step and 2000+ tokens; CMHA (4omini+TP) cuts latency by ${\sim}$57\% and tokens by ${\sim}$80\% with similar WR.
+
+\subsection{Case study}
+
+From Level~5 replays we compare CMHA and the baseline on harassment defense. In Figure~7, a small raid hits our main base; CMHA treats it as a local probe, keeps the current pulse, and counter-attacks with Stalkers. In Figure~8, the baseline treats the same probe as an all-in, abandons a half-built plan, over-defends, and loses. CMHA keeps deeper reasoning without sacrificing stability.
+
+\section{Conclusion}
+
+We present CMHA for \textit{StarCraft~II}: SPC handles counterfactual memory and SP-CoT macro reasoning; Tactical-Phi grounds commands locally. CMHA beats the \textsc{LLM-PySC2} baseline while cutting latency and token cost.
+
+\paragraph{Limitations.}
+Fixed sliding windows can split single events across slices. Evaluation is limited to \textit{StarCraft~II}; transfer to other domains is not yet tested.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

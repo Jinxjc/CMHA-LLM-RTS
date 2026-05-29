@@ -1,0 +1,12 @@
+CMHA (anonymous submission)
+Copyright 2026 Anonymous Authors
+
+This repository includes software from LLM-PySC2
+(https://github.com/NKAI-Decision-Team/LLM-PySC2), licensed under the
+Apache License, Version 2.0.
+
+This repository includes software from PySC2 (Google DeepMind), licensed under
+the Apache License, Version 2.0.
+
+CMHA-specific modifications (SPC layer, counterfactual memory, full-game
+experiments) are described in the paper and in docs/REPRODUCE.md.

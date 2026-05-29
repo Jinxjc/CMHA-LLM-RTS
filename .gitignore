@@ -1,0 +1,27 @@
+*.pyc
+*_pb2.py
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg-info/
+dist/
+build/
+
+# Secrets and local env
+.env
+.env.local
+*.pem
+
+# Experiment outputs (written to C: drive Desktop by default)
+llm_log/
+*.pkl
+*.log
+*.SC2Replay
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

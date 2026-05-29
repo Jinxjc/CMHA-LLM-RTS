@@ -1,0 +1,980 @@
+# Copyright 2024, LLM-PySC2 Contributors. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS-IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from llm_pysc2.lib.llm_communicate import communication_info_transmission
+from llm_pysc2.lib.log.data_recorder import DataRecorder
+from llm_pysc2.lib.spc_shared import clear as spc_shared_clear
+from llm_pysc2.lib.strategic_pulse_brain import StrategicPulseBrain
+from llm_pysc2.agents.main_agent_funcs import *
+from llm_pysc2.agents.llm_pysc2_agent import LLMAgent
+from llm_pysc2.cfg.config import ProtossAgentConfig
+
+from pysc2.agents import base_agent
+from pysc2.lib import actions
+
+from collections import deque
+from shutil import copyfile
+from loguru import logger
+import threading
+import datetime
+import random
+import math
+import time
+import copy
+import sys
+import os
+import json
+
+
+llm_pysc2_global_log_id = 0
+
+
+# multi thread query, target function
+def thread_act(agent, obs):
+  # agent_copy = copy.deepcopy(agent)
+  if agent.config.SAFE_MODE:
+    try:
+      agent.query(obs)
+    except Exception as e:
+      # agent = copy.deepcopy(agent_copy)
+      agent._after_query('Can not get LLM response due to technique problems', obs)
+      logger.error(f"error {e} occur in agent {agent.name} thread_act")
+  else:
+    agent.query(obs)
+
+
+# Main Agent, for interacting with pysc2 env
+class MainAgent(base_agent.BaseAgent):
+
+  def __init__(self, config=ProtossAgentConfig(), SubAgent=LLMAgent):
+    super(MainAgent, self).__init__()
+    """initalize the main agent"""
+    self._named_log_folder = None
+    resume_dir = os.environ.get('LLM_LOG_RESUME_DIR', '').strip()
+    named_folder = os.environ.get('LLM_LOG_FOLDER', '').strip()
+    if resume_dir:
+      resume_dir = os.path.abspath(resume_dir)
+      base = os.path.basename(resume_dir.rstrip(os.sep))
+      if '-' in base:
+        dash = base.rfind('-')
+        suffix = base[dash + 1:]
+        if suffix.isdigit():
+          self.start_time = base[:dash]
+          self.log_id = int(suffix)
+        else:
+          self.start_time = os.environ.get('LLM_RESUME_START_TIME', '').strip()
+          self.log_id = int(os.environ.get('LLM_RESUME_LOG_ID', '1'))
+          if not self.start_time:
+            raise ValueError(
+                f"Resume dir basename {base!r}: set LLM_RESUME_START_TIME and LLM_RESUME_LOG_ID "
+                "(e.g. first line of log_error.txt).")
+      else:
+        self.start_time = os.environ.get('LLM_RESUME_START_TIME', '').strip()
+        self.log_id = int(os.environ.get('LLM_RESUME_LOG_ID', '1'))
+        if not self.start_time:
+          raise ValueError(
+              f"Resume dir basename {base!r} has no '-'; set LLM_RESUME_START_TIME and "
+              f"LLM_RESUME_LOG_ID (e.g. first line of log_error.txt).")
+      self._resume_log_dir = resume_dir
+    elif named_folder:
+      self.start_time = os.environ.get(
+          'LLM_LOG_START_TIME',
+          str(datetime.datetime.now().strftime('%Y%m%d%H%M%S')))
+      self.log_id = int(os.environ.get('LLM_LOG_ID', '1'))
+      self._resume_log_dir = None
+      self._named_log_folder = named_folder
+    else:
+      self.start_time = str(datetime.datetime.now().strftime('%Y%m%d%H%M%S'))
+      self._resume_log_dir = None
+    self.config = config
+    self.AGENT_NAMES = list(self.config.AGENTS.keys())
+    self.race = self.config.race
+    self._initialize_variables()
+    self._initialize_logger()
+    self.config.auto_check(self.log_id)
+    self._initialize_agents(SubAgent)
+    self._initialize_strategic_brain()
+    self._initialize_data_recorder()
+    logger.success(f"[ID {self.log_id}] Main Agent successfully initialized!")
+
+  def _logger_filter_function(self, record):
+    return f"[ID {self.log_id}]" in record["message"]
+
+  def _initialize_variables(self):
+    # self.main_loop_lock = False
+    self.locks = {'main_loop': False, 'unit_grouping': False, 'worker_manage': False, 'worker_training': False, 'team_gathering': False, 'all_auxiliary_module': False}
+    self.main_loop_step_old = 0
+    self.main_loop_step = 0
+    self.game_time_last1 = 0
+    self.game_time_last2 = 0
+    self.current_game_time = 0
+
+    self.first_ctrl_base_tag = None
+    self.first_oppo_base_tag = None
+
+    self.unit_selected_tag_list = []
+    self.temp_team_unit_tags = None
+    self.temp_head_unit_tag = None
+    self.temp_curr_unit_tag = None
+    self.temp_head_unit = None
+    self.temp_curr_unit = None
+
+    self.agent_id = 0
+    self.size_screen = 0
+    self.size_minimap = 0
+    self.camera_threshold = 0.15
+    self.select_rect_threshold = 1
+
+    self.num_step = -1
+    self.world_range = 0
+    self.world_x_offset = 0
+    self.world_y_offset = 0
+    self.world_xy_calibration = False
+    self.first_select_unit_tag = None
+    self.last_two_camera_pos = deque(maxlen=2)
+    self.last_two_camera_pos.append([-1, -1])
+    self.last_two_camera_pos.append([-1, -1])
+
+    self.new_unit_tag = None
+    self.new_unit_type = None
+    self.temp_flag = None
+    self.unit_uid = list()
+    self.unit_uid_dead = list()
+    self.unit_uid_disappear = list()
+    self.unit_uid_appear = list()
+    self.unit_uid_total = list()
+    self.unit_disappear_steps = dict()
+    self.unit_tag_builder = list()
+    # self.unit_tag_worker_special = list()
+
+    # self.possible_disappear_unit_list = list()
+    self.func_id_history = deque(maxlen=20)
+    self.obs_history = deque(maxlen=5)
+
+    self.nexus_info_dict = {}
+    self.possible_working_place_tag_list = []
+    self.possible_working_place_nexus = []
+    self.stop_worker_nexus_tag = None
+    self.stop_worker_at = None
+    self.stop_worker = None
+    self.idle_nexus = None
+
+    # chat_message
+    self.last_action = None
+    self.last_team = None
+
+    try:
+      self.episode_save_offset = int(os.environ.get('EPISODE_INDEX_OFFSET', '0'))
+    except ValueError:
+      self.episode_save_offset = 0
+
+  def _initialize_logger(self):
+
+    global llm_pysc2_global_log_id
+
+    time.sleep(random.random())
+    base_log_dir = f"{os.path.dirname(os.path.abspath(__file__))}/../../llm_log"
+    if not os.path.exists(base_log_dir):
+      os.mkdir(base_log_dir)
+    if not os.path.exists(base_log_dir + f"/log_show.py"):
+      copyfile(f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log/log_show.py", base_log_dir + f"/log_show.py")
+    if not os.path.exists(base_log_dir + f"/log_analyse.py"):
+      copyfile(f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log/log_analyse.py", base_log_dir + f"/log_analyse.py")
+    _viewer_src = f"{os.path.dirname(os.path.abspath(__file__))}/../lib/log/llm_io_viewer.html"
+    if os.path.isfile(_viewer_src):
+      copyfile(_viewer_src, base_log_dir + f"/llm_io_viewer.html")
+
+    if self._resume_log_dir is not None:
+      self.log_dir_path = self._resume_log_dir
+      if not os.path.isdir(self.log_dir_path):
+        raise FileNotFoundError(f"LLM_LOG_RESUME_DIR not found: {self.log_dir_path}")
+      llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)
+      self.log_error_path = self.log_dir_path + f"/log_error.txt"
+      self.log_success_path = self.log_dir_path + f"/log_success.txt"
+      self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
+      self.log_info_path = self.log_dir_path + f"/log_info.txt"
+      meta_path = os.path.join(self.log_dir_path, 'resume_runs.jsonl')
+      try:
+        with open(meta_path, 'a', encoding='utf-8') as mf:
+          mf.write(json.dumps({
+              'episode_save_offset': self.episode_save_offset,
+              'max_episodes_env': os.environ.get('MAX_EPISODES', ''),
+              'pid': os.getpid(),
+          }, ensure_ascii=False) + '\n')
+      except OSError:
+        pass
+    elif getattr(self, '_named_log_folder', None):
+      self.log_dir_path = os.path.join(base_log_dir, self._named_log_folder)
+      os.makedirs(self.log_dir_path, exist_ok=True)
+      llm_pysc2_global_log_id = max(llm_pysc2_global_log_id, self.log_id)
+      self.log_error_path = self.log_dir_path + f"/log_error.txt"
+      self.log_success_path = self.log_dir_path + f"/log_success.txt"
+      self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
+      self.log_info_path = self.log_dir_path + f"/log_info.txt"
+    else:
+      self.log_id = -1
+      while True:
+        self.log_id += 1
+        self.log_dir_path = f"{os.path.dirname(os.path.abspath(__file__))}/../../llm_log/{self.start_time}-{self.log_id}"
+        if not os.path.exists(self.log_dir_path) and self.log_id == llm_pysc2_global_log_id + 1:
+          llm_pysc2_global_log_id += 1
+          self.log_error_path = self.log_dir_path + f"/log_error.txt"
+          self.log_success_path = self.log_dir_path + f"/log_success.txt"
+          self.log_debug_path = self.log_dir_path + f"/log_debug.txt"
+          self.log_info_path = self.log_dir_path + f"/log_info.txt"
+          os.mkdir(self.log_dir_path)
+          break
+
+    if not os.path.exists(self.log_error_path):
+      with open(self.log_error_path, 'w') as f:
+        print(self.start_time, file=f)
+    if not os.path.exists(self.log_success_path):
+      with open(self.log_success_path, 'w') as f:
+        print(self.start_time, file=f)
+    if not os.path.exists(self.log_debug_path):
+      with open(self.log_debug_path, 'w') as f:
+        print(self.start_time, file=f)
+    if not os.path.exists(self.log_info_path):
+      with open(self.log_info_path, 'w') as f:
+        print(self.start_time, file=f)
+
+    _abs_log = os.path.abspath(self.log_dir_path)
+    if str(os.environ.get("LLM_PYSC2_IO_JSONL", "")).strip().lower() in (
+        "1", "true", "yes", "on"):
+      self.config.LLM_IO_JSONL_RECORD = True
+    if getattr(self.config, 'LLM_IO_JSONL_RECORD', False):
+      self.config.LLM_IO_JSONL_PATH = os.path.join(_abs_log, 'llm_layers.jsonl')
+
+    logger.add(self.log_error_path, level="ERROR", rotation="100 MB", catch=True, filter=self._logger_filter_function)
+    logger.add(self.log_success_path, level="SUCCESS", rotation="100 MB", catch=True, filter=self._logger_filter_function)
+    logger.add(self.log_debug_path, level="DEBUG", rotation="100 MB", catch=True, filter=self._logger_filter_function)
+    logger.add(self.log_info_path, level="INFO", rotation="100 MB", catch=True, filter=self._logger_filter_function)
+    if self.log_id == 1:
+      try:
+        logger.remove(handler_id=0)
+        logger.add(sys.stderr, level="INFO", catch=True, filter=self._logger_filter_function)
+      except:
+        pass
+
+  def _initialize_agents(self, SubAgent):
+    self.agents = {}
+    self.agents_query_llm_times = {}
+    self.agents_executing_times = {}
+
+    sole = getattr(self.config, 'SINGLE_LLM_AGENT_NAME', 'Commander')
+    for agent_name in self.AGENT_NAMES:
+      self.agents[agent_name] = SubAgent(
+          agent_name, self.log_id, self.start_time, self.config,
+          log_root_dir=self.log_dir_path)
+      if getattr(self.config, 'ENABLE_SINGLE_LLM_AGENT', False):
+        self.agents[agent_name].enable = agent_name == sole
+      else:
+        self.agents[agent_name].enable = True if (agent_name in ['Commander', 'Developer']) else False
+      # self.agents[agent_name].flag_enable_empty_unit_group = True if (agent_name in ['Developer']) else False
+      for team in self.config.AGENTS[agent_name]['team'].values():
+        if len(team['unit_type']) == 0:
+          self.agents[agent_name].flag_enable_empty_unit_group = True
+      self.agents_query_llm_times[agent_name] = 0
+      self.agents_executing_times[agent_name] = 0
+      self.agents[agent_name].log_id = self.log_id
+
+  def _initialize_strategic_brain(self):
+    """顶层策脉与 Commander 解耦：共用 Commander 的 API client，由 MainAgent 每步驱动。"""
+    if not getattr(self.config, 'ENABLE_SPC_STRATEGIC_LAYER', True):
+      self.strategic_brain = None
+      return
+    cmd = self.agents.get('Commander')
+    if cmd is None:
+      self.strategic_brain = None
+      logger.warning(f"[ID {self.log_id}] MainAgent: no Commander; StrategicPulseBrain disabled")
+      return
+    self.strategic_brain = StrategicPulseBrain(
+        self.config,
+        self.log_id,
+        self.start_time,
+        llm_client=cmd.llm_client,
+        log_dir_path=self.log_dir_path,
+    )
+    logger.info(f"[ID {self.log_id}] MainAgent: StrategicPulseBrain initialized (shared LLM client with Commander)")
+
+  def _initialize_data_recorder(self):
+    self.data_recorder = DataRecorder(self.log_dir_path, save_level=0)
+
+  def reset(self):
+    """New SC2 episode: full per-game isolation (pysc2 run_loop calls this after env.reset)."""
+    super(MainAgent, self).reset()
+    ep_save = self.episodes + getattr(self, 'episode_save_offset', 0)
+    logger.success(
+        f"[ID {self.log_id}] New SC2 episode #{self.episodes} (save index {ep_save}): resetting all runtime state for a clean game."
+    )
+    self.steps = 0
+    self.reward = 0
+    self.game_time_last1 = 0.0
+    self.game_time_last2 = 0.0
+    self.current_game_time = 0.0
+    self.main_loop_step = 0
+    self.main_loop_step_old = 0
+    self.agent_id = 0
+    self.num_step = -1
+    for key in self.locks:
+      self.locks[key] = False
+    self.first_ctrl_base_tag = None
+    self.first_oppo_base_tag = None
+    self.unit_selected_tag_list = []
+    self.temp_team_unit_tags = None
+    self.temp_head_unit_tag = None
+    self.temp_curr_unit_tag = None
+    self.temp_head_unit = None
+    self.temp_curr_unit = None
+    self.world_xy_calibration = False
+    self.first_select_unit_tag = None
+    # 新一局必须重算世界范围与校准；若沿用上一局的 world_range>0 且 tag 已清空，
+    # main_agent_func0 会找不到 unit_r，在 episode 2 首步触发 AttributeError。
+    self.world_range = 0
+    self.world_x_offset = 0
+    self.world_y_offset = 0
+    self.last_two_camera_pos.clear()
+    self.last_two_camera_pos.append([-1, -1])
+    self.last_two_camera_pos.append([-1, -1])
+    self.new_unit_tag = None
+    self.new_unit_type = None
+    self.temp_flag = None
+    self.unit_uid = []
+    self.unit_uid_dead = []
+    self.unit_uid_disappear = []
+    self.unit_uid_appear = []
+    self.unit_uid_total = []
+    self.unit_disappear_steps = {}
+    self.unit_tag_builder = []
+    self.func_id_history.clear()
+    self.obs_history.clear()
+    self.nexus_info_dict = {}
+    self.possible_working_place_tag_list = []
+    self.possible_working_place_nexus = []
+    self.stop_worker_nexus_tag = None
+    self.stop_worker_at = None
+    self.stop_worker = None
+    self.idle_nexus = None
+    self.last_action = None
+    self.last_team = None
+    for agent_name in self.AGENT_NAMES:
+      self.agents_query_llm_times[agent_name] = 0
+      self.agents_executing_times[agent_name] = 0
+    spc_shared_clear(self.log_id, self.start_time)
+    if getattr(self, 'strategic_brain', None) is not None:
+      self.strategic_brain.reset_episode()
+    self.data_recorder.reset_episode()
+    for agent in self.agents.values():
+      agent.reset_episode_state()
+
+  def _all_agent_query_llm_finished(self):
+    for agent_name in self.AGENT_NAMES:
+      agent = self.agents[agent_name]
+      if agent.enable and agent.query_llm_times == self.main_loop_step:
+        return False
+    return True
+
+  def _all_agent_waiting_response_finished(self):
+    for agent_name in self.AGENT_NAMES:
+      agent = self.agents[agent_name]
+      if agent.enable and (agent.query_llm_times == self.main_loop_step + 1) and agent._is_waiting_response():
+        return False
+    return True
+
+  def _all_agent_executing_finished(self):
+    for agent_name in self.AGENT_NAMES:
+      agent = self.agents[agent_name]
+      if agent.enable and agent.executing_times == self.main_loop_step:
+        return False
+    return True
+
+  def step(self, obs):
+    super(MainAgent, self).step(obs)
+
+    # main agent control data updates
+    agent_name = None
+    self.obs_history.append(obs)
+    ep_save = self.episodes + getattr(self, 'episode_save_offset', 0)
+    self.data_recorder.step(obs, ep_save, self.steps)
+    self.last_action = None
+    if len(self.func_id_history) > 0 and self.func_id_history[-1] == 573:
+      self.camera_threshold += 0.05
+    elif len(self.func_id_history) > 0 and self.func_id_history[-1] == 3:
+      self.select_rect_threshold = self.select_rect_threshold * 2 if 0 < self.select_rect_threshold < self.size_screen else self.size_screen
+    else:
+      self.select_rect_threshold = 1 * int(self.size_screen / 128) if self.size_screen != 0 else 1
+      self.camera_threshold = 0.15
+    if self.main_loop_step_old != self.main_loop_step:
+      self.main_loop_step_old = self.main_loop_step
+      # self.main_loop_lock = False
+      for key in self.locks.keys():
+        self.locks[key] = False
+      logger.success(f"[ID {self.log_id}] " + '========== ' + '==' * 25 + f" Loop {self.main_loop_step} " + '==' * 25 + ' ==========')
+    logger.success(f"[ID {self.log_id}] " + '---------- ' + '--' * 25 + f" Step {self.steps} " + '--' * 25 + ' ----------')
+
+    func_id, func_call = (0, actions.FUNCTIONS.no_op())
+    safe_mode = self.config.SAFE_MODE
+
+    last_20_func = list(self.func_id_history)
+    last_7_func = list(self.func_id_history) if len(self.func_id_history) <= 7 else list(self.func_id_history)[-7:]
+    possible_endless_loop = False
+    if not safe_mode and len(set(last_20_func)) == 1 and len(last_20_func) >= 20 and 0 not in last_20_func:
+      possible_endless_loop = True
+      logger.error(f"[ID {self.log_id}] Detect Possible Endless Loop !")
+      logger.error(f"[ID {self.log_id}] last 20 funcs: {actions.FUNCTIONS[last_20_func[0]]}")
+      time.sleep(1)
+    if safe_mode and self.main_loop_step > 0 and len(set(last_7_func)) == 1 and len(last_7_func) >= 7 and 0 not in last_7_func:
+      possible_endless_loop = True
+      logger.error(f"[ID {self.log_id}] Detect Possible Endless Loop !")
+      logger.error(f"[ID {self.log_id}] last 7 funcs: {actions.FUNCTIONS[last_7_func[0]]}")
+      time.sleep(0.1)
+    # if safe_mode and len(self.func_id_history) > 3 and self.func_id_history[-1] == 264 and self.func_id_history[-2] == 264:
+    #   possible_endless_loop = True
+    #   logger.error(f"[ID {self.log_id}] Detect Possible 264 Endless Loop !")
+    #   time.sleep(0.1)
+
+    # LLM decision frequency control
+    game_time_s = obs.observation.game_loop / 22.4
+    self.current_game_time = game_time_s
+    # if not self.main_loop_lock and game_time_s - self.game_time_last1 < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+    if self.main_loop_step > 0 and not self.locks['main_loop'] and self.locks['all_auxiliary_module'] and game_time_s - self.game_time_last1 < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+      logger.warning(f"[ID {self.log_id}] Reach MAX_LLM_DECISION_FREQUENCY! return no_op()")
+      func_id, func_call = (0, actions.FUNCTIONS.no_op())
+      self.func_id_history.append(func_id)
+      return func_call
+
+    base_exist, worker_exist = False, False
+    for unit in obs.observation.raw_units:
+      if unit.unit_type in BASE_BUILDING_TYPE and unit.alliance == features.PlayerRelative.SELF:
+        base_exist = True
+      if unit.unit_type in WORKER_TYPE and unit.alliance == features.PlayerRelative.SELF:
+        worker_exist = True
+      if base_exist and worker_exist:
+        break
+
+    # initial steps and camera calibration (necessary)
+    func_id, func_call = main_agent_func0(self, obs)
+    if func_call is not None:
+      if not safe_mode or not (possible_endless_loop and func_id in last_20_func):
+        logger.success(f"[ID {self.log_id}] main_agent_func0: Func Call {func_id} {func_call}")
+        return func_call
+
+    # auto worker-training (optional if only concerns about combat, otherwise necessary)
+    if base_exist:
+      func_id, func_call = main_agent_func3(self, obs)
+      if func_call is not None:
+        logger.success(f"[ID {self.log_id}] main_agent_func3 (worker-training): Func Call {func_id} {func_call}")
+        return func_call
+    else:
+      logger.error(f"[ID {self.log_id}] it seems that base do not exist? is it the last step?")
+
+    if base_exist and (not safe_mode or (safe_mode and not possible_endless_loop)) and not self.locks['all_auxiliary_module']:
+
+      # unit grouping, add to relevant agent.teams (necessary)
+      func_id, func_call = main_agent_func1(self, obs)
+      if func_call is not None:  #  and not self.locks['unit_grouping']
+        if not safe_mode or not (possible_endless_loop and func_id in last_20_func):
+          logger.success(f"[ID {self.log_id}] main_agent_func1 (unit grouping): Func Call {func_id} {func_call}")
+          return func_call
+      self.locks['unit_grouping'] = True
+
+      # auto team gathering (optional)
+      if not self.locks['team_gathering']:
+        func_id, func_call = main_agent_func4(self, obs)
+        if func_call is not None:
+          logger.success(f"[ID {self.log_id}] main_agent_func4 (team gathering): Func Call {func_id} {func_call}")
+          return func_call
+      self.locks['team_gathering'] = True
+
+      # auto worker-management (optional)
+      if worker_exist:
+        func_id, func_call = main_agent_func2(self, obs)
+        if func_call is not None:
+          logger.success(f"[ID {self.log_id}] main_agent_func2 (worker-management): Func Call {func_id} {func_call}")
+          return func_call
+      else:
+        logger.error(f"[ID {self.log_id}] it seems that worker do not exist? is it the last step?")
+
+    if not possible_endless_loop:
+      self.locks['all_auxiliary_module'] = True
+
+    # SubAgent data update
+    for agent_name in self.AGENT_NAMES:
+      agent = self.agents[agent_name]
+      agent.num_step = self.steps
+      agent.main_loop_step = self.main_loop_step
+      agent.world_range = self.world_range
+      agent.world_x_offset = self.world_x_offset
+      agent.world_y_offset = self.world_y_offset
+      agent.size_screen = self.size_screen
+      agent.size_minimap = self.size_minimap
+      agent.update(obs)
+
+    # 顶层策脉（StrategicPulseBrain）：与 Commander 解耦；SPC维护自身长期记忆，仅可选接收 Commander 执行反馈
+    if getattr(self, 'strategic_brain', None) is not None:
+      cmd = self.agents.get('Commander')
+      fb = getattr(cmd, 'last_action_feedback', '') or '' if cmd else ''
+      cmd_obs_text = ''
+      if cmd is not None:
+        try:
+          # Use the same translator path as Commander tactical input so SPC sees
+          # a full observation text from the same source.
+          cmd_obs_text = cmd.get_text_o(obs)
+        except Exception as e:
+          logger.warning(f"[ID {self.log_id}] StrategicBrain: cannot build commander observation text: {e}")
+      if not getattr(self.config, 'SPC_INCLUDE_COMMANDER_FEEDBACK', False):
+        fb = ''
+      self.strategic_brain.maybe_run_tick(
+          obs,
+          self.steps,
+          main_loop_step=self.main_loop_step,
+          commander_feedback=fb,
+          commander_observation_text=cmd_obs_text,
+      )
+
+    sole = getattr(self.config, 'SINGLE_LLM_AGENT_NAME', 'Commander')
+    for agent_name in self.AGENT_NAMES:
+      agent = self.agents[agent_name]
+      agent.other_agents = {}
+      if getattr(self.config, 'ENABLE_SINGLE_LLM_AGENT', False):
+        if agent.name == sole:
+          for agent_name2 in self.AGENT_NAMES:
+            if agent_name2 != sole:
+              agent.other_agents[agent_name2] = self.agents[agent_name2]
+      elif agent.name in ['Commander', 'Developer']:
+        for agent_name2 in self.AGENT_NAMES:
+          if agent_name2 not in ['Commander', 'Developer']:
+            agent.other_agents[agent_name2] = self.agents[agent_name2]
+      if agent.name in ['Builder']:
+        self.unit_tag_builder = agent.unit_tag_list_history
+
+    # critical data log
+    main_agent_func_critical_data_log(self, obs)
+
+    # # LLM decision frequency control
+    # game_time_s = obs.observation.game_loop / 22.4
+    # self.current_game_time = game_time_s
+    # # if not self.main_loop_lock and game_time_s - self.game_time_last1 < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+    # if not self.locks['main_loop'] and game_time_s - self.game_time_last1 < 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+    #   logger.warning(f"[ID {self.log_id}] Reach MAX_LLM_DECISION_FREQUENCY! return no_op()")
+    #   func_id, func_call = (0, actions.FUNCTIONS.no_op())
+    #   self.func_id_history.append(func_id)
+    #   return func_call
+
+    # skip main loop if no agent enabled
+    all_agent_disabled = True
+    for agent_name in self.AGENT_NAMES:
+      if self.agents[agent_name].enable:
+        all_agent_disabled = False
+    if all_agent_disabled:
+      logger.warning(f"[ID {self.log_id}] All agent disabled! return no_op()")
+      func_id, func_call = (0, actions.FUNCTIONS.no_op())
+      self.func_id_history.append(func_id)
+      return func_call
+
+    # communication and ready to enter main loop
+    # if self.main_loop_lock is False:
+    #   self.main_loop_lock = True
+    if game_time_s - self.game_time_last1 > 1 / self.config.MAX_LLM_DECISION_FREQUENCY:
+      if self.locks['main_loop'] is False:
+        for key in self.locks.keys():
+          self.locks[key] = True
+        # self.game_time_last1 = game_time_s
+        communication_info_transmission(self)
+        logger.success(f"[ID {self.log_id}] 7.0.0 Main Loop Lock! Ignore outer-loop actions. ")
+      else:
+        pass
+    else:
+      logger.warning(f"[ID {self.log_id}] 7.0.1 Reach MAX_LLM_DECISION_FREQUENCY! return no_op(). ")
+      func_id, func_call = (0, actions.FUNCTIONS.no_op())
+      self.func_id_history.append(func_id)
+      return func_call
+
+
+    # Main Loop
+    t0 = float(time.time())
+    while float(time.time()) - t0 < self.config.MAX_LLM_WAITING_TIME:
+      time.sleep(0.001)
+
+      agent_name = self.AGENT_NAMES[self.agent_id]
+      agent = self.agents[self.AGENT_NAMES[self.agent_id]]
+      func_id, func_call, enable_no_op = (None, None, False)
+
+      if not agent.enable:  # agent finished query, skip current agent
+        self.agent_id = (self.agent_id + 1) % len(self.AGENT_NAMES)
+        continue
+
+      if not self._all_agent_query_llm_finished():
+
+        if not agent._is_waiting_query():
+          logger.error(f"[ID {self.log_id}] 7.0 Agent {agent_name}: status should not exist")
+          logger.debug(f"[ID {self.log_id}]     Agent Info: {len(agent.func_list)} {len(agent.action_list)} {len(agent.action_lists)} {agent.is_waiting}")
+          # for team in agent.teams:
+          #   logger.debug(f"[ID {self.log_id}]     Team Infos:{team}")
+          agent.func_list, agent.action_list, agent.action_lists = [], [], []  #  TODO: Test this
+          self.agent_id = (self.agent_id + 1) % len(self.AGENT_NAMES)
+          # continue
+
+        else:  # collect obs and query llm
+          logger.info(f"[ID {self.log_id}] 7.1 Agent {agent_name}: query status")
+
+          # agent teams' obses all collected, start query llm
+          if agent._is_all_my_teams_ready_to_query():
+            if agent.flag_enable_empty_unit_group:  # Commander Developer最后一个单位群是空群，用于作战部署或发布训练/研究动作
+              logger.info(f"[ID {self.log_id}] 7.1.1 Agent {agent_name}: Add obs for empty_unit_group")
+              for team in agent.teams:
+                if len(team['unit_type']) == 0:  # if team['unit_type'] == 'Empty':
+                  agent.team_unit_obs_list.append(obs)
+                  team['obs'].append(obs)
+            logger.info(f"[ID {self.log_id}] 7.1.2 Agent {agent_name}: Obs prepared, try calling LLM api")
+            logger.debug(f"[ID {self.log_id}] len(agent.team_unit_obs_list) = {len(agent.team_unit_obs_list)}")
+            logger.debug(f"[ID {self.log_id}] len(agent.team_unit_tag_list) = {len(agent.team_unit_tag_list)}")
+            logger.debug(f"[ID {self.log_id}] len(agent.team_unit_team_list) = {len(agent.team_unit_team_list)}")
+            if not self.config.ENABLE_MULTI_THREAD_QUERY:
+              agent.query(obs)
+            else:
+              agent.thread = threading.Thread(target=thread_act, args=(agent, obs))
+              agent.thread.start()
+            agent.query_llm_times += 1
+            self.agent_id = (self.agent_id + 1) % len(self.AGENT_NAMES)
+            self.unit_selected_tag_list = []
+            if self._all_agent_query_llm_finished():
+              logger.success(f"[ID {self.log_id}] 7.2 All Agent waiting for response")
+            func_id, func_call = (4, actions.FUNCTIONS.select_control_group("recall", 0))
+            return func_call
+
+          else:
+            # obtain team and head unit tag
+            logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.3")
+            team, tag = agent._get_unobsed_team_and_unit_tag()
+
+            # Move camera
+            func_id, func_call = get_camera_func_smart(self, obs, tag, threshold=self.camera_threshold, team=team, mode='o')
+            if func_id == 573:
+              logger.success(f"[ID {self.log_id}] 7.1.4 Func Call: {func_call}")
+              self.func_id_history.append(func_id)
+              return func_call
+
+            # Find team head unit
+            unit_f = None
+            for unit in obs.observation.feature_units:
+              if unit.tag == tag:
+                unit_f = unit
+            if unit_f is None:
+              logger.error(f"[ID {self.log_id}] Agent {agent_name}: unit of tag {tag} not found in screen")
+              logger.error(f"[ID {self.log_id}]                     relevant team = {team['name']}")
+              logger.error(f"[ID {self.log_id}] unit_f is None")
+              if tag in team['unit_tags']:
+                team['unit_tags'].remove(tag)
+              if tag in agent.unit_tag_list:
+                agent.unit_tag_list.remove(tag)
+              agent.update(obs)
+              time.sleep(1)
+              continue
+
+            # Select unit
+            if not unit_f.is_selected:
+              logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5")
+              if team['select_type'] == 'select':
+                logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.1")
+                if self.func_id_history[-1] in [2, 3]:
+                  d = self.select_rect_threshold
+                  x1, x2 = min(max(0, unit_f.x - d), self.size_screen), min(max(0, unit_f.x + d), self.size_screen)
+                  y1, y2 = min(max(0, unit_f.y - d), self.size_screen), min(max(0, unit_f.y + d), self.size_screen)
+                  func_id, func_call = (3, actions.FUNCTIONS.select_rect('select', (x1, y1), (x2, y2)))
+                else:
+                  x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
+                  func_id, func_call = (2, actions.FUNCTIONS.select_point('select', (x, y)))
+                logger.success(f"[ID {self.log_id}] 7.1.5.1 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                return func_call
+              elif team['select_type'] == 'select_all_type':
+                logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.2")
+                if self.func_id_history[-1] in [2, 3]:
+                  d = self.select_rect_threshold
+                  x1, x2 = min(max(0, unit_f.x - d), self.size_screen), min(max(0, unit_f.x + d), self.size_screen)
+                  y1, y2 = min(max(0, unit_f.y - d), self.size_screen), min(max(0, unit_f.y + d), self.size_screen)
+                  func_id, func_call = (3, actions.FUNCTIONS.select_rect('select', (x1, y1), (x2, y2)))
+                else:
+                  x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
+                  func_id, func_call = (2, actions.FUNCTIONS.select_point('select_all_type', (x, y)))
+                logger.success(f"[ID {self.log_id}] 7.1.5.1 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                return func_call
+              elif team['select_type'] == 'group':
+                logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.3")
+                func_id, func_call = (4, actions.FUNCTIONS.select_control_group('recall', int(team['game_group'])))
+                logger.success(f"[ID {self.log_id}] 7.1.5.1 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                return func_call
+              else:
+                logger.error(f"[ID {self.log_id}] 7.1.2.4 Agent {agent_name}: Un-Recogniziable select type")
+                time.sleep(5)  # this error may lead to endless loop
+                pass
+
+            # Recheck all required unit selected (Warning: May Lead To Possible Endless Loop)
+            for unit in obs.observation.feature_units:
+              if team['select_type'] == 'group' and \
+                unit.tag in team['unit_tags'] and not unit.is_selected and \
+                  0.15 * self.size_screen < unit.x < 0.85 * self.size_screen and \
+                  0.15 * self.size_screen < unit.y < 0.85 * self.size_screen:
+                logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.4")
+                func_id, func_call = (4, actions.FUNCTIONS.select_control_group('recall', int(team['game_group'])))
+                logger.success(f"[ID {self.log_id}] 7.1.5.4 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                return func_call
+              # if team['select_type'] == 'select_all_type' and \
+              #     unit.unit_type == unit_f.unit_type and not unit.is_selected and \
+              #     0.15 * self.size_screen < unit.x < 0.85 * self.size_screen and \
+              #     0.15 * self.size_screen < unit.y < 0.85 * self.size_screen:
+              #   logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.4")
+              #   func_id, func_call = (2, actions.FUNCTIONS.select_point('select_all_type', (unit_f.x, unit_f.y)))
+              #   logger.success(f"[ID {self.log_id}] 7.1.5.4 Agent {agent_name}: Func Call: {func_call}")
+              #   self.func_id_history.append(func_id)
+              #   return func_call
+
+            # collect obs for the team
+            if unit_f.is_selected:
+              logger.info(f"[ID {self.log_id}] 7.1.6 Agent {agent_name}: collect obs for team {team['name']}")
+              logger.info("--" * 25)
+              team['unit_tags_selected'] = []
+              for unit in obs.observation.raw_units:
+                if unit.tag == tag:
+                  x, y = get_camera_xy(self, unit.x, unit.y)
+                  team['pos'].append([x, y])
+                  team['camera_move'] = []
+                if unit.is_selected and unit.is_on_screen:
+                  team['unit_tags_selected'].append(unit.tag)
+              team['obs'].append(obs)
+              agent.team_unit_obs_list.append(obs)  # collect team obs
+              agent.team_unit_tag_list.append(tag)
+              agent.team_unit_team_list.append(team['name'])
+
+              idx = np.nonzero(obs.observation['feature_minimap']['camera'])  # 获取特征图上非零值的坐标
+              minimap_x, minimap_y = int(idx[:][1].mean()), int(idx[:][0].mean())
+              team['minimap_pos'].append([minimap_x, minimap_y])
+
+      elif not self._all_agent_waiting_response_finished():
+        continue
+
+      elif not self._all_agent_executing_finished():
+
+        if game_time_s - self.game_time_last2 < 0.5:  # self.config.MIN_ACTION_EXECUTING_TIME
+          logger.warning(f"[ID {self.log_id}] Reach MIN_ACTION_EXECUTING_TIME! return no_op()")
+          func_id, func_call = (0, actions.FUNCTIONS.no_op())
+          self.func_id_history.append(func_id)
+          return func_call
+
+        # agent's teams' actions all executed
+        if not agent._is_executing_actions():
+          logger.info(f"[ID {self.log_id}] 7.3.0 Agent {agent_name}: finished executing!")
+          agent.executing_times = self.main_loop_step + 1
+          agent.team_unit_obs_list = []
+          agent.team_unit_tag_list = []
+          agent.team_unit_team_list = []
+          for i in range(len(agent.teams)):
+            agent.teams[i]['obs'] = []
+            agent.teams[i]['pos'] = []
+            agent.teams[i]['camera_move'] = []
+            # agent.teams[i]['unit_tags_selected'] = []
+          self.agent_id = (self.agent_id + 1) % len(self.AGENT_NAMES)
+          continue
+
+        else:
+          logger.info(f"[ID {self.log_id}] 7.3.1 Agent {agent_name}: executing status")
+
+          # obtain actions of next team
+          if len(agent.func_list) == 0 and len(agent.action_list) == 0 and len(agent.action_lists) > 0:
+
+            # standard team
+            if len(agent.team_unit_tag_list) != 0:  # not (agent.flag_enable_empty_unit_group) or
+              logger.debug(f"[ID {self.log_id}] Agent {agent_name}, status: 7.3.1.1")
+              agent.action_list = agent.action_lists.pop(0)
+              agent.team_unit_tag_curr = agent.team_unit_tag_list.pop(0)
+              agent.team_unit_team_curr = agent.team_unit_team_list.pop(0)
+            # empty team  (only for spesified empty team)
+            else:
+              logger.debug(f"[ID {self.log_id}] Agent {agent_name}, status: 7.3.1.2")
+              agent.action_list = agent.action_lists.pop(0)
+
+          # empty team excuting actions (only for spesified empty team)
+          if (agent.flag_enable_empty_unit_group and len(agent.team_unit_tag_list) == 0):
+            logger.debug(f"[ID {self.log_id}] Agent {agent_name}, status: 7.3.5")
+            func_id, func_call, enable_no_op, self.last_action = agent.get_func(obs)
+            self.func_id_history.append(func_id)
+
+          # standard team excuting actions
+          else:
+
+            # get current action name and args
+            if len(agent.func_list) == 0 and len(agent.action_list) != 0:
+              agent.curr_action_name = agent.action_list[0]['name']
+              agent.curr_action_args = agent.action_list[0]['arg']
+
+            # obtain team and head unit tag
+            logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.2")
+            team, tag = agent._get_unacted_team_and_unit_tag()
+            self.last_team = team['name']
+            if tag == None:  # single select team, unit dead / multi select team, all unit dead, relese actions
+              agent.func_list = []
+              agent.action_list = []
+              continue
+            unit_f = None
+            unit_r = None
+            for unit in obs.observation.raw_units:
+              if unit.tag == tag:
+                unit_r = unit
+
+            if len(agent.func_list) == 0 and ('Select_Unit_' not in agent.curr_action_name):
+
+              # Move camera
+              func_id, func_call = get_camera_func_smart(self, obs, tag, threshold=self.camera_threshold, team=team, mode='a')
+              if func_id == 573:
+                logger.success(f"[ID {self.log_id}] 7.3.2.0 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                return func_call
+
+              # Find team head unit
+              for unit in obs.observation.feature_units:
+                if unit.tag == tag:
+                  unit_f = unit
+              if unit_f is None:
+                logger.error(f"[ID {self.log_id}] 7.3.2.1 Agent {agent_name}: unit of tag {tag} not found in screen")
+                logger.error(f"[ID {self.log_id}]         relative team = {team['name']} {team['unit_tags']}")
+                func_id, func_call, enable_no_op, _ = agent.get_func(obs)  # 销掉这个动作
+                logger.error(f"[ID {self.log_id}] 7.3.4 Agent {agent_name}: Func Call: {func_call}")
+                self.func_id_history.append(func_id)
+                time.sleep(1)
+
+              # Unit select
+              if (unit_f is not None and not unit_f.is_selected):
+                logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3")
+                if team['select_type'] == 'select':
+                  logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3.1")
+                  if self.func_id_history[-1] in [2, 3]:
+                    d = self.select_rect_threshold
+                    x1, x2 = min(max(0, unit_f.x - d), self.size_screen), min(max(0, unit_f.x + d), self.size_screen)
+                    y1, y2 = min(max(0, unit_f.y - d), self.size_screen), min(max(0, unit_f.y + d), self.size_screen)
+                    func_id, func_call = (3, actions.FUNCTIONS.select_rect('select', (x1, y1), (x2, y2)))
+                  else:
+                    x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
+                    func_id, func_call = (2, actions.FUNCTIONS.select_point('select', (x, y)))
+                  logger.success(f"[ID {self.log_id}] Agent {agent_name}: Func Call: {func_call}")
+                  self.func_id_history.append(func_id)
+                  return func_call
+                elif team['select_type'] == 'select_all_type':
+                  logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3.2")
+                  if self.func_id_history[-1] in [2, 3]:
+                    d = self.select_rect_threshold
+                    x1, x2 = min(max(0, unit_f.x - d), self.size_screen), min(max(0, unit_f.x + d), self.size_screen)
+                    y1, y2 = min(max(0, unit_f.y - d), self.size_screen), min(max(0, unit_f.y + d), self.size_screen)
+                    func_id, func_call = (3, actions.FUNCTIONS.select_rect('select', (x1, y1), (x2, y2)))
+                  else:
+                    x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
+                    func_id, func_call = (2, actions.FUNCTIONS.select_point('select_all_type', (x, y)))
+                  logger.success(f"[ID {self.log_id}] Agent {agent_name}: Func Call: {func_call}")
+                  self.func_id_history.append(func_id)
+                  return func_call
+                elif team['select_type'] == 'group':
+                  logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3.3")
+                  func_id, func_call = (4, actions.FUNCTIONS.select_control_group('recall', int(team['game_group'])))
+                  logger.success(f"[ID {self.log_id}] Agent {agent_name}: Func Call: {func_call}")
+                  self.func_id_history.append(func_id)
+                  return func_call
+                else:
+                  logger.error(f"[ID {self.log_id}] 7.3.3.4 Agent {agent_name}: un-recogniziable select type")
+                  time.sleep(5)  # this error may lead to endless loop
+                  pass
+
+              # Recheck all required unit selected (Warning: May Lead To Possible Endless Loop)
+              for unit in obs.observation.feature_units:
+                if team['select_type'] == 'group' and \
+                    unit.tag in team['unit_tags'] and not unit.is_selected and \
+                    0.15 * self.size_screen < unit.x < 0.85 * self.size_screen and \
+                    0.15 * self.size_screen < unit.y < 0.85 * self.size_screen:
+                  logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.1.5.4")
+                  func_id, func_call = (4, actions.FUNCTIONS.select_control_group('recall', int(team['game_group'])))
+                  logger.success(f"[ID {self.log_id}] 7.1.5.4 Agent {agent_name}: Func Call: {func_call}")
+                  self.func_id_history.append(func_id)
+                  return func_call
+                # if team['select_type'] == 'select_all_type' and \
+                #     unit.unit_type == unit_f.unit_type and not unit.is_selected and \
+                #     0.15 * self.size_screen < unit.x < 0.85 * self.size_screen and \
+                #     0.15 * self.size_screen < unit.y < 0.85 * self.size_screen:
+                #   logger.debug(f"[ID {self.log_id}] Agent {agent_name} status: 7.3.3.5")
+                #   x, y = min(max(0, unit_f.x), self.size_screen), min(max(0, unit_f.y), self.size_screen)
+                #   func_id, func_call = (2, actions.FUNCTIONS.select_point('select_all_type', (x, y)))
+                #   logger.success(f"[ID {self.log_id}] 7.3.3.5 Agent {agent_name}: Func Call: {func_call}")
+                #   self.func_id_history.append(func_id)
+                #   return func_call
+
+            # get pysc2 function of current action
+            if (unit_f is not None and unit_f.is_selected) or \
+              ('Select_Unit_' in agent.curr_action_name) or \
+              len(agent.func_list) != 0:
+              func_id, func_call, enable_no_op, self.last_action = agent.get_func(obs)
+              logger.info(f"[ID {self.log_id}] 7.3.4 Agent {agent_name}: agent.get_func(obs): get {func_call}")
+              self.func_id_history.append(func_id)
+
+            # mark units that finished excution
+            for unit in obs.observation.raw_units:
+              if unit.is_selected and unit.is_on_screen:
+                self.unit_selected_tag_list.append(unit.tag)
+            self.unit_selected_tag_list = list(set(self.unit_selected_tag_list))
+
+      else:
+        # all agent' teams finished excution, release main_loop_lock to enable auto management fo workers, bases, etc.
+        logger.success(f"[ID {self.log_id}] 7.3.5 Agent {agent_name}: One loop finished, release self.main_loop_lock")
+        self.main_loop_step += 1
+        # self.main_loop_lock = False  # release main_loop_lock to enable auto management
+        for key in self.locks.keys():
+          self.locks[key] = False
+        self.game_time_last2 = game_time_s
+        self.game_time_last1 = game_time_s
+        func_id, func_call = (0, actions.FUNCTIONS.no_op())
+        self.func_id_history.append(func_id)
+        return func_call
+
+      # execute function of current agent's current action
+      if func_id != 0 or (func_id == 0 and enable_no_op):
+        if func_id in obs.observation.available_actions:
+          logger.success(f"[ID {self.log_id}] 7.4 Agent {agent_name} Func Call: {func_call}")
+          self.func_id_history.append(func_id)
+          return func_call
+        else:
+          if func_id is not None:
+            logger.error(f"[ID {self.log_id}] 7.5.1 Agent {agent_name} Func Call Invalid, Skipped: {func_call}")
+
+    # execute no-operation function while reach waiting time
+    func_id, func_call = (0, actions.FUNCTIONS.no_op())
+    logger.warning(f"[ID {self.log_id}] Reach MAX_LLM_WAITING_TIME! {agent_name} Call no_op()")
+    logger.warning(f"[ID {self.log_id}] Func Call: {func_call}")
+    self.func_id_history.append(func_id)
+    return func_call
+
+  def send_chat_message(self):
+    if not getattr(self.config, 'ENABLE_IN_GAME_ACTION_CHAT', False):
+      return None
+    if self.steps == 1:
+      return f" Good Luck Have Fun!"
+    if self.last_action is not None:
+      time_m = self.steps / 22.4 // 60
+      time_s = self.steps / 22.4 % 60
+      time_s_ = int(100 * round(time_s-math.floor(time_s), 2))
+      text_time_m = f'0{math.floor(time_m)}' if math.floor(time_m) < 10 else f'{math.floor(time_m)}'
+      text_time_s = f'0{math.floor(time_s)}' if math.floor(time_s) < 10 else f'{math.floor(time_s)}'
+      text_time_s_ = f'0{time_s_}' if math.floor(time_s_) < 10 else f'{time_s_}'
+      # return f"{self.last_action} {self.last_team} Step{self.main_loop_step} ({text_time_m}:{text_time_s}:{text_time_s_}) "
+      return f"{self.last_team} Step{self.main_loop_step} ({text_time_m}:{text_time_s}:{text_time_s_}) {self.last_action} "
+    return None
